@@ -3,10 +3,13 @@ import bcrypt from "bcrypt";
 import { assertSignupRole, signupRoleState, withVerificationRedirect } from "../src/auth/auth.js";
 import { env, corsOrigins, trustedOrigins } from "../src/config/env.js";
 import { evaluateValidation, canTransition } from "../src/modules/payments/payment-state.js";
-import { mimeMatchesExt, kindOfMime, PURPOSE_RULES } from "../src/modules/uploads.routes.js";
+import { mimeMatchesExt, kindOfMime, PURPOSE_RULES, detectFileType } from "../src/modules/uploads.routes.js";
 import { formatZodError } from "../src/common/middleware.js";
 import { contentBody, httpUrl } from "../src/common/schemas.js";
 import { z } from "zod";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const order = { tranId: "LT-1", amount: 500, currency: "BDT" };
 const valid = { status: "VALID", tran_id: "LT-1", amount: "500.00", currency: "BDT", risk_level: "0", val_id: "v1" };
@@ -186,5 +189,38 @@ describe("upload type rules (§9)", () => {
   it("still rejects a mislabelled file (MIME does not belong to the extension)", () => {
     expect(mimeMatchesExt("image/png", "photo.jpg")).toBe(false);
     expect(mimeMatchesExt("video/mp4", "photo.png")).toBe(false);
+  });
+
+  it("detects photos and MP4s from a bounded header read of the temp file", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lt-upload-"));
+    try {
+      const jpg = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9]);
+      const mp4 = Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D, 0x00, 0x00, 0x02, 0x00, 0x69, 0x73, 0x6F, 0x6D, 0x69, 0x73, 0x6F, 0x32]);
+      const jpgPath = path.join(dir, "photo.jpg");
+      const mp4Path = path.join(dir, "clip.mp4");
+      const fakePath = path.join(dir, "fake.jpg");
+      fs.writeFileSync(jpgPath, jpg);
+      fs.writeFileSync(mp4Path, mp4);
+      fs.writeFileSync(fakePath, "not an image");
+
+      await expect(detectFileType(jpgPath, jpg.length)).resolves.toEqual({ ext: "jpg", mime: "image/jpeg" });
+      await expect(detectFileType(mp4Path, mp4.length)).resolves.toEqual({ ext: "mp4", mime: "video/mp4" });
+      // A renamed non-image must stay undetected so the route rejects it.
+      expect(await detectFileType(fakePath, 12)).toBeUndefined();
+      // Empty / single-byte temp files (e.g. an aborted upload) are not images.
+      expect(await detectFileType(jpgPath, 1)).toBeUndefined();
+      expect(await detectFileType(jpgPath, 0)).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Regression guard for a production-only failure: file-type's file reader is
+  // loaded via a non-literal dynamic import('strtok3') that serverless bundlers
+  // cannot trace, so fileTypeFromFile throws ERR_MODULE_NOT_FOUND when deployed
+  // even though it works locally. Detection must go through fileTypeFromBuffer.
+  it("never imports fileTypeFromFile", () => {
+    const source = fs.readFileSync(new URL("../src/modules/uploads.routes.ts", import.meta.url), "utf8");
+    expect(source).not.toMatch(/import\s*\{[^}]*fileTypeFromFile/);
   });
 });

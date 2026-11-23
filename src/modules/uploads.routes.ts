@@ -3,11 +3,12 @@ import fs from "fs";
 import path from "path";
 import { Router } from "express";
 import multer from "multer";
-import { fileTypeFromFile } from "file-type";
+import { fileTypeFromBuffer } from "file-type";
 import { z } from "zod";
 import { env } from "../config/env.js";
 import { asyncHandler, ok, p } from "../common/middleware.js";
 import { badRequest, forbidden, notFound } from "../common/errors.js";
+import { logger } from "../common/logger.js";
 import { requireRole } from "../auth/guards.js";
 import { Exam, ExamAttempt, Upload } from "../models/index.js";
 import { storage, quarantineKey, approvedKey } from "../services/storage.js";
@@ -120,9 +121,38 @@ export function labelForMime(mime: string): string {
   return "File";
 }
 
+/** Bytes read from the start of a temp file for magic-byte detection. Every
+ *  accepted format keeps its signature well inside the first 64 KiB. */
+const DETECTION_HEADER_BYTES = 64 * 1024;
+
+/**
+ * Detect a temp file's real type from its magic bytes.
+ *
+ * Deliberately uses `fileTypeFromBuffer` and NOT `fileTypeFromFile`: file-type
+ * loads its Node file reader through a non-literal dynamic `import('strtok3')`,
+ * which serverless bundlers (Vercel) cannot trace. In production the traced
+ * bundle therefore lacks `strtok3/lib/index.js`, `fileTypeFromFile` throws
+ * ERR_MODULE_NOT_FOUND, and every upload is rejected as a type mismatch.
+ * Buffer detection has no filesystem/dynamic-import dependency, so it behaves
+ * identically locally and when bundled.
+ */
+export async function detectFileType(filePath: string, size: number) {
+  const length = Math.min(DETECTION_HEADER_BYTES, Math.max(size, 0));
+  if (length < 2) return undefined;
+  const handle = await fs.promises.open(filePath, "r");
+  try {
+    const header = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(header, 0, length, 0);
+    if (bytesRead < 2) return undefined;
+    return await fileTypeFromBuffer(header.subarray(0, bytesRead));
+  } finally {
+    await handle.close();
+  }
+}
+
 // Multer caps per purpose: fileSize must be the MAX of the types that purpose
 // accepts (multer runs before magic-byte detection), the exact per-type limit
-// is enforced again in handleUpload() after fileTypeFromFile().
+// is enforced again in handleUpload() after detectFileType().
 function multerLimitsForPurpose(purpose: string): { fileSize: number; files: number } {
   if (purpose === "assignment")
     return {
@@ -167,7 +197,12 @@ async function handleUpload(req: any, purpose: string, scanner?: BouncerClient) 
     const rules = PURPOSE_RULES[purpose]!;
     const ext = path.extname(file.originalname).toLowerCase();
     if (!rules.exts.includes(ext)) throw badRequest(`Extension ${ext} not allowed for ${purpose}`);
-    const detected = await fileTypeFromFile(file.path).catch(() => undefined);
+    const detected = await detectFileType(file.path, file.size).catch((err: unknown) => {
+      // Never silently treat a detector crash as "unknown type": that is how the
+      // production-only fileTypeFromFile bundling failure stayed invisible.
+      logger.warn({ err: (err as Error)?.message, purpose }, "upload type detection failed");
+      return undefined;
+    });
     if (!detected || !rules.mimes.includes(detected.mime) || !mimeMatchesExt(detected.mime, file.originalname)) throw badRequest("File content does not match declared type");
     // NOTE: the browser-declared MIME (file.mimetype) is NOT trusted — browsers
     // report .mp4 inconsistently ("", "application/octet-stream", "video/mpeg",
